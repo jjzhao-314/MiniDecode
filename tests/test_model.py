@@ -1,10 +1,22 @@
 import pytest
 import torch
 from torch import nn
-from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm
+from transformers import Qwen3Config
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3MLP,
+    Qwen3RMSNorm,
+    Qwen3RotaryEmbedding,
+    apply_rotary_pos_emb as hf_apply_rotary_pos_emb,
+)
 
 from minidecode.config import MiniDecodeConfig
-from minidecode.model import MLP, RMSNorm
+from minidecode.model import (
+    MLP,
+    RMSNorm,
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
+    rotate_half,
+)
 
 
 def make_test_config() -> MiniDecodeConfig:
@@ -22,6 +34,26 @@ def make_test_config() -> MiniDecodeConfig:
         hidden_act="silu",
         attention_bias=False,
         tie_word_embeddings=True,
+    )
+
+
+def make_hf_test_config(config: MiniDecodeConfig) -> Qwen3Config:
+    return Qwen3Config(
+        vocab_size=config.vocab_size,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        num_hidden_layers=config.num_hidden_layers,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": config.rope_theta,
+        },
+        hidden_act=config.hidden_act,
+        attention_bias=config.attention_bias,
+        tie_word_embeddings=config.tie_word_embeddings,
     )
 
 
@@ -105,3 +137,72 @@ def test_mlp_matches_hugging_face(dtype: torch.dtype) -> None:
     torch.testing.assert_close(actual, expected)
     assert actual.shape == input_tensor.shape
     assert actual.dtype == input_tensor.dtype
+
+
+def test_rotate_half_uses_split_half_layout() -> None:
+    input_tensor = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+
+    actual = rotate_half(input_tensor)
+
+    expected = torch.tensor([[-3.0, -4.0, 1.0, 2.0]])
+    torch.testing.assert_close(actual, expected)
+
+
+def test_rotary_embedding_registers_non_persistent_buffer() -> None:
+    rope = RotaryEmbedding(make_test_config())
+
+    assert rope.inv_freq.shape == (8,)
+    assert rope.inv_freq.dtype == torch.float32
+    assert "inv_freq" in dict(rope.named_buffers())
+    assert "inv_freq" not in rope.state_dict()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rotary_embedding_matches_hugging_face(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    actual_rope = RotaryEmbedding(config)
+    expected_rope = Qwen3RotaryEmbedding(make_hf_test_config(config))
+    input_tensor = torch.randn(2, 5, config.hidden_size, dtype=dtype)
+    position_ids = torch.tensor(
+        [[0, 1, 2, 3, 4], [3, 4, 5, 6, 7]], dtype=torch.long
+    )
+
+    actual_cos, actual_sin = actual_rope(input_tensor, position_ids)
+    expected_cos, expected_sin = expected_rope(input_tensor, position_ids)
+
+    torch.testing.assert_close(actual_cos, expected_cos)
+    torch.testing.assert_close(actual_sin, expected_sin)
+    assert actual_cos.shape == (2, 5, config.head_dim)
+    assert actual_cos.dtype == dtype
+    assert actual_sin.dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_apply_rotary_pos_emb_matches_hugging_face(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    actual_rope = RotaryEmbedding(config)
+    expected_rope = Qwen3RotaryEmbedding(make_hf_test_config(config))
+    input_tensor = torch.randn(2, 5, config.hidden_size, dtype=dtype)
+    position_ids = torch.arange(5).unsqueeze(0).expand(2, -1)
+    actual_cos, actual_sin = actual_rope(input_tensor, position_ids)
+    expected_cos, expected_sin = expected_rope(input_tensor, position_ids)
+    query = torch.randn(
+        2, config.num_attention_heads, 5, config.head_dim, dtype=dtype
+    )
+    key = torch.randn(
+        2, config.num_key_value_heads, 5, config.head_dim, dtype=dtype
+    )
+
+    actual_query, actual_key = apply_rotary_pos_emb(
+        query, key, actual_cos, actual_sin
+    )
+    expected_query, expected_key = hf_apply_rotary_pos_emb(
+        query, key, expected_cos, expected_sin
+    )
+
+    torch.testing.assert_close(actual_query, expected_query)
+    torch.testing.assert_close(actual_key, expected_key)
+    torch.testing.assert_close(actual_query[:, :, 0], query[:, :, 0])
+    torch.testing.assert_close(actual_key[:, :, 0], key[:, :, 0])
+    assert actual_query.shape == query.shape
+    assert actual_key.shape == key.shape
