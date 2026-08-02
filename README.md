@@ -55,5 +55,34 @@ MiniDecode/
 - CUDA Toolkit：13.3；
 - Ninja：1.13.2。
 
-环境和依赖会随着项目搭建进一步固化，最终提供可复现的构建、测试和 Benchmark
-命令。
+## 安装与构建
+
+首先准备带 CUDA 支持的 PyTorch 环境，并确保 `nvcc` 可用。当前开发环境使用名为
+`cuda` 的 Conda 环境：
+
+```bash
+conda activate cuda
+export CUDA_HOME=/usr/local/cuda
+export TORCH_CUDA_ARCH_LIST=12.0
+python -m pip install -e ".[model,test]" --no-build-isolation
+```
+
+`--no-build-isolation` 使 extension 构建过程使用当前环境中已经安装的 PyTorch。构建完成
+后，`minidecode._C` 提供 Python 到 C++/CUDA 的最小调用链。
+
+## 模型准备
+
+Qwen3-0.6B 使用 Hugging Face 默认缓存，不将模型权重放入 Git 仓库：
+
+```bash
+hf download Qwen/Qwen3-0.6B
+```
+
+## 测试
+
+```bash
+python -m pytest -q
+```
+
+当前测试覆盖最小 CUDA extension 的数值正确性、空 tensor，以及 device、连续性和
+dtype 检查。后续模型、KV Cache 和自定义 kernel 测试继续使用同一入口。

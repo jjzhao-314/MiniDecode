@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 
 [project.optional-dependencies]
+model = ["transformers==5.14.1"]
 test = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
