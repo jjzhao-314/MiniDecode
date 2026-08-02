@@ -9,7 +9,13 @@ description = "A learning-oriented single-GPU LLM inference engine."
 readme = "README.md"
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["minidecode*"]
 exclude = ["benchmarks*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
