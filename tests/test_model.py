@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3Attention,
     Qwen3MLP,
     Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
@@ -11,10 +12,13 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from minidecode.config import MiniDecodeConfig
 from minidecode.model import (
+    Attention,
     MLP,
     RMSNorm,
     RotaryEmbedding,
     apply_rotary_pos_emb,
+    make_causal_mask,
+    repeat_kv,
     rotate_half,
 )
 
@@ -206,3 +210,76 @@ def test_apply_rotary_pos_emb_matches_hugging_face(dtype: torch.dtype) -> None:
     torch.testing.assert_close(actual_key[:, :, 0], key[:, :, 0])
     assert actual_query.shape == query.shape
     assert actual_key.shape == key.shape
+
+
+def test_repeat_kv_preserves_grouped_head_order() -> None:
+    hidden_states = torch.tensor([[[[10.0]], [[20.0]]]])
+
+    actual = repeat_kv(hidden_states, num_key_value_groups=2)
+
+    expected = torch.tensor([[[[10.0]], [[10.0]], [[20.0]], [[20.0]]]])
+    torch.testing.assert_close(actual, expected)
+
+
+def test_repeat_kv_returns_input_for_single_group() -> None:
+    hidden_states = torch.randn(2, 4, 3, 8)
+
+    actual = repeat_kv(hidden_states, num_key_value_groups=1)
+
+    assert actual is hidden_states
+
+
+def test_make_causal_mask_blocks_future_positions() -> None:
+    input_tensor = torch.randn(2, 3, 64)
+
+    actual = make_causal_mask(input_tensor)
+
+    minimum = torch.finfo(input_tensor.dtype).min
+    expected = torch.tensor(
+        [[[[0.0, minimum, minimum], [0.0, 0.0, minimum], [0.0, 0.0, 0.0]]]]
+    )
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == (1, 1, 3, 3)
+    assert actual.dtype == input_tensor.dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_attention_matches_hugging_face(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    hf_config = make_hf_test_config(config)
+    hf_config._attn_implementation = "eager"
+    actual_attention = Attention(config).to(dtype=dtype)
+    expected_attention = Qwen3Attention(hf_config, layer_idx=0).to(dtype=dtype)
+    expected_attention.load_state_dict(actual_attention.state_dict())
+    hidden_states = torch.randn(2, 5, config.hidden_size, dtype=dtype)
+    position_ids = torch.tensor([[0, 1, 2, 3, 4], [2, 3, 4, 5, 6]])
+    actual_position_embeddings = RotaryEmbedding(config)(
+        hidden_states, position_ids
+    )
+    expected_position_embeddings = Qwen3RotaryEmbedding(hf_config)(
+        hidden_states, position_ids
+    )
+    attention_mask = make_causal_mask(hidden_states)
+
+    actual_output, actual_weights = actual_attention(
+        hidden_states, actual_position_embeddings, attention_mask
+    )
+    expected_output, expected_weights = expected_attention(
+        hidden_states, expected_position_embeddings, attention_mask
+    )
+
+    torch.testing.assert_close(actual_output, expected_output)
+    torch.testing.assert_close(actual_weights, expected_weights)
+    torch.testing.assert_close(
+        actual_weights.sum(dim=-1), torch.ones_like(actual_weights[..., 0])
+    )
+    assert (actual_weights.triu(diagonal=1) == 0).all()
+    assert actual_output.shape == hidden_states.shape
+    assert actual_weights.shape == (
+        2,
+        config.num_attention_heads,
+        5,
+        5,
+    )
+    assert actual_output.dtype == dtype
+    assert actual_weights.dtype == dtype
