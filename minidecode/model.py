@@ -49,15 +49,17 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_dim = config.head_dim
         self.rope_theta = config.rope_theta
-        indices = torch.arange(0, self.head_dim, 2)
-        inv_freq = 1.0 / self.rope_theta ** (indices / self.head_dim)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, idxs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         origin_type = x.dtype
-        freqs = idxs.unsqueeze(-1) * self.inv_freq.unsqueeze(0).unsqueeze(0)
+        indices = torch.arange(
+            0, self.head_dim, 2, device=x.device, dtype=torch.float32
+        )
+        inv_freq = 1.0 / self.rope_theta ** (indices / self.head_dim)
+        positions = idxs.to(device=x.device, dtype=torch.float32)
+        freqs = positions.unsqueeze(-1) * inv_freq[None, None, :]
         freqs = torch.cat([freqs, freqs], dim=-1).to(torch.float32)
         cos = torch.cos(freqs).to(origin_type)
         sin = torch.sin(freqs).to(origin_type)
@@ -203,3 +205,59 @@ class DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+
+
+class MiniDecodeModel(nn.Module):
+    def __init__(self, config: MiniDecodeConfig):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = RotaryEmbedding(config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)  # B, S, 1024
+        if position_ids is None:
+            position_ids = torch.arange(
+                input_ids.shape[1],
+                device=input_ids.device,
+            ).unsqueeze(0)  # 1, S
+
+        attention_mask = make_causal_mask(hidden_states)  # 1, 1, S, S
+        position_embeddings = self.rotary_emb(
+            hidden_states,
+            position_ids,
+        )  # 1, S, 128
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+            )
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
+class MiniDecodeForCausalLM(nn.Module):
+    def __init__(self, config: MiniDecodeConfig):
+        super().__init__()
+        self.model = MiniDecodeModel(config)
+
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids, position_ids)
+        logits = self.lm_head(hidden_states)
+        return logits

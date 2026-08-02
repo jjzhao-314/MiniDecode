@@ -5,6 +5,7 @@ from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3DecoderLayer,
+    Qwen3ForCausalLM,
     Qwen3MLP,
     Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
@@ -16,6 +17,7 @@ from minidecode.model import (
     Attention,
     DecoderLayer,
     MLP,
+    MiniDecodeForCausalLM,
     RMSNorm,
     RotaryEmbedding,
     apply_rotary_pos_emb,
@@ -154,19 +156,10 @@ def test_rotate_half_uses_split_half_layout() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_rotary_embedding_registers_non_persistent_buffer() -> None:
-    rope = RotaryEmbedding(make_test_config())
-
-    assert rope.inv_freq.shape == (8,)
-    assert rope.inv_freq.dtype == torch.float32
-    assert "inv_freq" in dict(rope.named_buffers())
-    assert "inv_freq" not in rope.state_dict()
-
-
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_rotary_embedding_matches_hugging_face(dtype: torch.dtype) -> None:
     config = make_test_config()
-    actual_rope = RotaryEmbedding(config)
+    actual_rope = RotaryEmbedding(config).to(dtype=dtype)
     expected_rope = Qwen3RotaryEmbedding(make_hf_test_config(config))
     input_tensor = torch.randn(2, 5, config.hidden_size, dtype=dtype)
     position_ids = torch.tensor(
@@ -316,4 +309,34 @@ def test_decoder_layer_matches_hugging_face(dtype: torch.dtype) -> None:
 
     torch.testing.assert_close(actual, expected)
     assert actual.shape == hidden_states.shape
+    assert actual.dtype == dtype
+
+
+def test_causal_lm_ties_embedding_and_lm_head_weights() -> None:
+    model = MiniDecodeForCausalLM(make_test_config())
+
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_causal_lm_matches_hugging_face(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    hf_config = make_hf_test_config(config)
+    hf_config._attn_implementation = "eager"
+    actual_model = MiniDecodeForCausalLM(config).to(dtype=dtype).eval()
+    expected_model = Qwen3ForCausalLM(hf_config).to(dtype=dtype).eval()
+    expected_model.model.rotary_emb = Qwen3RotaryEmbedding(hf_config)
+    expected_model.load_state_dict(actual_model.state_dict())
+    input_ids = torch.tensor([[1, 2, 3, 4, 5], [8, 7, 6, 5, 4]])
+    position_ids = torch.tensor([[0, 1, 2, 3, 4], [2, 3, 4, 5, 6]])
+
+    with torch.no_grad():
+        actual = actual_model(input_ids, position_ids)
+        expected = expected_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+        ).logits
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == (2, 5, config.vocab_size)
     assert actual.dtype == dtype
