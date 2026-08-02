@@ -1,0 +1,52 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# C++ / CUDA build products
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+compile_commands.json
+CMakeFiles/
+cmake-build-*/
+.torch_extensions/
+
+# Profiling output
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Model weights and local caches
+models/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
