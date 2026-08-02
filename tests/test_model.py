@@ -4,6 +4,7 @@ from torch import nn
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
+    Qwen3DecoderLayer,
     Qwen3MLP,
     Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
@@ -13,6 +14,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from minidecode.config import MiniDecodeConfig
 from minidecode.model import (
     Attention,
+    DecoderLayer,
     MLP,
     RMSNorm,
     RotaryEmbedding,
@@ -283,3 +285,35 @@ def test_attention_matches_hugging_face(dtype: torch.dtype) -> None:
     )
     assert actual_output.dtype == dtype
     assert actual_weights.dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_decoder_layer_matches_hugging_face(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    hf_config = make_hf_test_config(config)
+    hf_config._attn_implementation = "eager"
+    actual_layer = DecoderLayer(config).to(dtype=dtype)
+    expected_layer = Qwen3DecoderLayer(hf_config, layer_idx=0).to(dtype=dtype)
+    expected_layer.load_state_dict(actual_layer.state_dict())
+    hidden_states = torch.randn(2, 5, config.hidden_size, dtype=dtype)
+    position_ids = torch.tensor([[0, 1, 2, 3, 4], [2, 3, 4, 5, 6]])
+    actual_position_embeddings = RotaryEmbedding(config)(
+        hidden_states, position_ids
+    )
+    expected_position_embeddings = Qwen3RotaryEmbedding(hf_config)(
+        hidden_states, position_ids
+    )
+    attention_mask = make_causal_mask(hidden_states)
+
+    actual = actual_layer(
+        hidden_states, actual_position_embeddings, attention_mask
+    )
+    expected = expected_layer(
+        hidden_states,
+        attention_mask=attention_mask,
+        position_embeddings=expected_position_embeddings,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == hidden_states.shape
+    assert actual.dtype == dtype

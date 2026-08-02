@@ -172,3 +172,34 @@ class Attention(nn.Module):
         context = self.o_proj(context)  # B, S, 1024
 
         return context, weights
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, config: MiniDecodeConfig):
+        super().__init__()
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = Attention(config)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.mlp = MLP(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states, position_embeddings, attention_mask
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
