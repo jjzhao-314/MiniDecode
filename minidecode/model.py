@@ -276,7 +276,11 @@ class MiniDecodeForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         kv_caches: ContiguousKVCache,
         position_ids: torch.Tensor | None = None,
+        last_token_only: bool = False,
     ):
         hidden_states = self.model(input_ids, kv_caches, position_ids)
-        logits = self.lm_head(hidden_states)
+        if last_token_only:
+            logits = self.lm_head(hidden_states[:, -1:, :])
+        else:
+            logits = self.lm_head(hidden_states)
         return logits

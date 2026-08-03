@@ -478,3 +478,24 @@ def test_causal_lm_cached_decode_matches_full_sequence(dtype: torch.dtype) -> No
     torch.testing.assert_close(incremental_cache.k_cache, full_cache.k_cache)
     torch.testing.assert_close(incremental_cache.v_cache, full_cache.v_cache)
     assert incremental_cache.cur_len == 5
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_causal_lm_last_token_logits_match_full_logits(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    model = MiniDecodeForCausalLM(config).to(dtype=dtype).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5], [8, 7, 6, 5, 4]])
+    full_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
+    last_token_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
+
+    with torch.no_grad():
+        full_logits = model(input_ids, full_cache)
+        last_token_logits = model(
+            input_ids,
+            last_token_cache,
+            last_token_only=True,
+        )
+
+    assert full_logits.shape == (2, 5, config.vocab_size)
+    assert last_token_logits.shape == (2, 1, config.vocab_size)
+    torch.testing.assert_close(last_token_logits, full_logits[:, -1:])

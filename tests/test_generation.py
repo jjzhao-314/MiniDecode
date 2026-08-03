@@ -33,21 +33,25 @@ class PredictSequenceModel(nn.Module):
         self.input_lengths: list[int] = []
         self.cache_lengths_before_forward: list[int] = []
         self.cache_object_ids: list[int] = []
+        self.last_token_only_values: list[bool] = []
 
     def forward(
         self,
         input_ids: torch.Tensor,
         kv_caches: ContiguousKVCache,
         position_ids: torch.Tensor | None = None,
+        last_token_only: bool = False,
     ) -> torch.Tensor:
         self.grad_enabled_during_forward.append(torch.is_grad_enabled())
         self.input_lengths.append(input_ids.shape[1])
         self.cache_lengths_before_forward.append(kv_caches.cur_len)
         self.cache_object_ids.append(id(kv_caches))
+        self.last_token_only_values.append(last_token_only)
         step = len(self.input_lengths) - 1
+        output_length = 1 if last_token_only else input_ids.shape[1]
         logits = torch.zeros(
             input_ids.shape[0],
-            input_ids.shape[1],
+            output_length,
             self.vocab_size,
         )
         logits[:, -1, self.predicted_ids[step]] = 1.0
@@ -72,6 +76,7 @@ def test_greedy_generate_appends_argmax_tokens() -> None:
     assert model.input_lengths == [3, 1, 1]
     assert model.cache_lengths_before_forward == [0, 3, 4]
     assert len(set(model.cache_object_ids)) == 1
+    assert model.last_token_only_values == [True, True, True]
 
 
 def test_greedy_generate_stops_after_eos() -> None:
@@ -95,6 +100,7 @@ def test_greedy_generate_stops_after_eos() -> None:
     assert model.input_lengths == [2, 1]
     assert model.cache_lengths_before_forward == [0, 2]
     assert len(set(model.cache_object_ids)) == 1
+    assert model.last_token_only_values == [True, True]
 
 
 def test_greedy_generate_handles_zero_new_tokens() -> None:

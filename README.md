@@ -86,3 +86,21 @@ python -m pytest -q
 
 当前测试覆盖最小 CUDA extension 的数值正确性、空 tensor，以及 device、连续性和
 dtype 检查。后续模型、KV Cache 和自定义 kernel 测试继续使用同一入口。
+
+## 生成性能基线
+
+使用本地 Qwen3-0.6B BF16 权重，对完整序列重算和预分配 Contiguous KV Cache 进行
+对比：
+
+```bash
+python -m benchmarks.benchmark_generation \
+  --model-path Qwen/Qwen3-0.6B \
+  --prompt-length 128 \
+  --new-tokens 16 \
+  --warmup 3 \
+  --repeats 5
+```
+
+模型加载、KV Cache 分配和 warmup 不进入计时区间。脚本使用 CUDA Event 测量 TTFT
+与 TPOT，同时报告单请求 tokens/s、KV Cache 容量和峰值分配显存。模型名会通过
+Hugging Face 本地缓存解析；也可以给 `--model-path` 传入本地 snapshot 目录。

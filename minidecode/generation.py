@@ -24,7 +24,7 @@ def greedy_generate(
             input_ids.device,
         )
         for _ in range(max_new_tokens):
-            output = model(model_input, kv_caches)
+            output = model(model_input, kv_caches, last_token_only=True)
             next_logits = output[:, -1, :]
             next_id = torch.argmax(next_logits, dim=-1)
             model_input = next_id[:, None]
