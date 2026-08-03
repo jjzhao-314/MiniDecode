@@ -111,3 +111,50 @@ def test_write_rejects_incompatible_kv_shape() -> None:
 
     with pytest.raises(ValueError, match="batch size 1"):
         cache.write(0, K.expand(2, -1, -1, -1), V.expand(2, -1, -1, -1), [0, 1])
+
+
+def test_read_restores_logical_token_and_head_order() -> None:
+    cache = make_cache()
+    K, V = make_kv(num_tokens=6)
+    block_ids = [3, 1]
+    slot_mapping = [12, 13, 14, 15, 4, 5]
+    cache.write(0, K, V, slot_mapping)
+
+    actual_K, actual_V = cache.read(0, block_ids, num_tokens=6)
+
+    torch.testing.assert_close(actual_K, K)
+    torch.testing.assert_close(actual_V, V)
+    assert actual_K.shape == (1, 3, 6, 5)
+    assert actual_V.shape == actual_K.shape
+
+
+def test_read_returns_empty_sequence() -> None:
+    cache = make_cache()
+
+    K, V = cache.read(0, [], num_tokens=0)
+
+    assert K.shape == (1, 3, 0, 5)
+    assert V.shape == K.shape
+
+
+@pytest.mark.parametrize("layer_idx", [-1, 2])
+def test_read_rejects_invalid_layer(layer_idx: int) -> None:
+    cache = make_cache()
+
+    with pytest.raises(IndexError, match="invalid layer index"):
+        cache.read(layer_idx, [], num_tokens=0)
+
+
+def test_read_rejects_inconsistent_block_count() -> None:
+    cache = make_cache()
+
+    with pytest.raises(ValueError, match="block_ids does not match"):
+        cache.read(0, [1], num_tokens=5)
+
+
+@pytest.mark.parametrize("block_id", [-1, 4])
+def test_read_rejects_invalid_physical_block(block_id: int) -> None:
+    cache = make_cache()
+
+    with pytest.raises(IndexError, match="invalid physical block"):
+        cache.read(0, [block_id], num_tokens=1)
