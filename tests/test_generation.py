@@ -3,6 +3,7 @@ from torch import nn
 
 from minidecode.config import MiniDecodeConfig
 from minidecode.generation import greedy_generate
+from minidecode.kv_cache import ContiguousKVCache
 from minidecode.model import MiniDecodeForCausalLM
 
 
@@ -12,21 +13,37 @@ class PredictSequenceModel(nn.Module):
         self.prompt_length = prompt_length
         self.predicted_ids = predicted_ids
         self.vocab_size = vocab_size
+        self.config = MiniDecodeConfig(
+            vocab_size=vocab_size,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=32,
+            rms_norm_eps=1e-6,
+            rope_theta=1_000_000.0,
+            hidden_act="silu",
+            attention_bias=False,
+            tie_word_embeddings=True,
+        )
+        self.lm_head = nn.Linear(1, 1, bias=False)
         self.grad_enabled_during_forward: list[bool] = []
         self.input_lengths: list[int] = []
-        self.received_position_ids: list[torch.Tensor | None] = []
-        self.received_kv_caches: list[list[torch.Tensor] | None] = []
+        self.cache_lengths_before_forward: list[int] = []
+        self.cache_object_ids: list[int] = []
 
     def forward(
         self,
         input_ids: torch.Tensor,
+        kv_caches: ContiguousKVCache,
         position_ids: torch.Tensor | None = None,
-        kv_caches: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> torch.Tensor:
         self.grad_enabled_during_forward.append(torch.is_grad_enabled())
         self.input_lengths.append(input_ids.shape[1])
-        self.received_position_ids.append(position_ids)
-        self.received_kv_caches.append(kv_caches)
+        self.cache_lengths_before_forward.append(kv_caches.cur_len)
+        self.cache_object_ids.append(id(kv_caches))
         step = len(self.input_lengths) - 1
         logits = torch.zeros(
             input_ids.shape[0],
@@ -34,7 +51,8 @@ class PredictSequenceModel(nn.Module):
             self.vocab_size,
         )
         logits[:, -1, self.predicted_ids[step]] = 1.0
-        return logits, [torch.tensor(step)]
+        kv_caches.advance(input_ids.shape[1])
+        return logits
 
 
 def test_greedy_generate_appends_argmax_tokens() -> None:
@@ -52,10 +70,8 @@ def test_greedy_generate_appends_argmax_tokens() -> None:
     torch.testing.assert_close(input_ids, torch.tensor([[1, 2, 3]]))
     assert model.grad_enabled_during_forward == [False, False, False]
     assert model.input_lengths == [3, 1, 1]
-    assert model.received_position_ids == [None, None, None]
-    assert model.received_kv_caches[0] is None
-    assert model.received_kv_caches[1] is not None
-    assert model.received_kv_caches[2] is not None
+    assert model.cache_lengths_before_forward == [0, 3, 4]
+    assert len(set(model.cache_object_ids)) == 1
 
 
 def test_greedy_generate_stops_after_eos() -> None:
@@ -77,9 +93,8 @@ def test_greedy_generate_stops_after_eos() -> None:
     torch.testing.assert_close(actual, expected)
     assert model.grad_enabled_during_forward == [False, False]
     assert model.input_lengths == [2, 1]
-    assert model.received_position_ids == [None, None]
-    assert model.received_kv_caches[0] is None
-    assert model.received_kv_caches[1] is not None
+    assert model.cache_lengths_before_forward == [0, 2]
+    assert len(set(model.cache_object_ids)) == 1
 
 
 def test_greedy_generate_handles_zero_new_tokens() -> None:
@@ -117,9 +132,19 @@ def test_cached_generation_matches_full_sequence_recomputation() -> None:
     input_ids = torch.tensor([[1, 2, 3, 4]])
 
     expected = input_ids
+    recompute_cache = ContiguousKVCache(
+        num_layers=config.num_hidden_layers,
+        batch_size=1,
+        num_kv_heads=config.num_key_value_heads,
+        max_seq_len=input_ids.shape[1] + 4,
+        head_dim=config.head_dim,
+        dtype=model.lm_head.weight.dtype,
+        device=input_ids.device,
+    )
     with torch.no_grad():
         for _ in range(4):
-            logits, _ = model(expected)
+            recompute_cache.reset()
+            logits = model(expected, recompute_cache)
             next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
             expected = torch.cat([expected, next_id], dim=-1)
 

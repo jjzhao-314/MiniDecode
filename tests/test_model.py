@@ -13,6 +13,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from minidecode.config import MiniDecodeConfig
+from minidecode.kv_cache import ContiguousKVCache
 from minidecode.model import (
     Attention,
     DecoderLayer,
@@ -63,6 +64,24 @@ def make_hf_test_config(config: MiniDecodeConfig) -> Qwen3Config:
         hidden_act=config.hidden_act,
         attention_bias=config.attention_bias,
         tie_word_embeddings=config.tie_word_embeddings,
+    )
+
+
+def make_test_cache(
+    config: MiniDecodeConfig,
+    *,
+    batch_size: int = 2,
+    max_seq_len: int = 5,
+    dtype: torch.dtype = torch.float32,
+) -> ContiguousKVCache:
+    return ContiguousKVCache(
+        num_layers=config.num_hidden_layers,
+        batch_size=batch_size,
+        num_kv_heads=config.num_key_value_heads,
+        max_seq_len=max_seq_len,
+        head_dim=config.head_dim,
+        dtype=dtype,
+        device=torch.device("cpu"),
     )
 
 
@@ -244,7 +263,7 @@ def test_attention_matches_hugging_face(dtype: torch.dtype) -> None:
     config = make_test_config()
     hf_config = make_hf_test_config(config)
     hf_config._attn_implementation = "eager"
-    actual_attention = Attention(config).to(dtype=dtype)
+    actual_attention = Attention(config, layer_idx=0).to(dtype=dtype)
     expected_attention = Qwen3Attention(hf_config, layer_idx=0).to(dtype=dtype)
     expected_attention.load_state_dict(actual_attention.state_dict())
     hidden_states = torch.randn(2, 5, config.hidden_size, dtype=dtype)
@@ -256,9 +275,10 @@ def test_attention_matches_hugging_face(dtype: torch.dtype) -> None:
         hidden_states, position_ids
     )
     attention_mask = make_causal_mask(hidden_states)
+    kv_cache = make_test_cache(config, dtype=dtype)
 
-    actual_output, actual_kv_cache = actual_attention(
-        hidden_states, actual_position_embeddings, attention_mask
+    actual_output = actual_attention(
+        hidden_states, actual_position_embeddings, attention_mask, kv_cache
     )
     expected_output, expected_weights = expected_attention(
         hidden_states, expected_position_embeddings, attention_mask
@@ -274,13 +294,15 @@ def test_attention_matches_hugging_face(dtype: torch.dtype) -> None:
     )
     assert actual_output.dtype == dtype
     assert expected_weights.dtype == dtype
-    assert actual_kv_cache[0].shape == (
+    assert kv_cache.k_cache[0, :, :, :5].shape == (
         2,
         config.num_key_value_heads,
         5,
         config.head_dim,
     )
-    assert actual_kv_cache[1].shape == actual_kv_cache[0].shape
+    assert kv_cache.v_cache[0, :, :, :5].shape == kv_cache.k_cache[
+        0, :, :, :5
+    ].shape
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -288,7 +310,7 @@ def test_decoder_layer_matches_hugging_face(dtype: torch.dtype) -> None:
     config = make_test_config()
     hf_config = make_hf_test_config(config)
     hf_config._attn_implementation = "eager"
-    actual_layer = DecoderLayer(config).to(dtype=dtype)
+    actual_layer = DecoderLayer(config, layer_idx=0).to(dtype=dtype)
     expected_layer = Qwen3DecoderLayer(hf_config, layer_idx=0).to(dtype=dtype)
     expected_layer.load_state_dict(actual_layer.state_dict())
     hidden_states = torch.randn(2, 5, config.hidden_size, dtype=dtype)
@@ -300,9 +322,10 @@ def test_decoder_layer_matches_hugging_face(dtype: torch.dtype) -> None:
         hidden_states, position_ids
     )
     attention_mask = make_causal_mask(hidden_states)
+    kv_cache = make_test_cache(config, dtype=dtype)
 
-    actual, actual_kv_cache = actual_layer(
-        hidden_states, actual_position_embeddings, attention_mask
+    actual = actual_layer(
+        hidden_states, actual_position_embeddings, attention_mask, kv_cache
     )
     expected = expected_layer(
         hidden_states,
@@ -313,13 +336,15 @@ def test_decoder_layer_matches_hugging_face(dtype: torch.dtype) -> None:
     torch.testing.assert_close(actual, expected)
     assert actual.shape == hidden_states.shape
     assert actual.dtype == dtype
-    assert actual_kv_cache[0].shape == (
+    assert kv_cache.k_cache[0, :, :, :5].shape == (
         2,
         config.num_key_value_heads,
         5,
         config.head_dim,
     )
-    assert actual_kv_cache[1].shape == actual_kv_cache[0].shape
+    assert kv_cache.v_cache[0, :, :, :5].shape == kv_cache.k_cache[
+        0, :, :, :5
+    ].shape
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -327,7 +352,7 @@ def test_decoder_layer_cached_decode_matches_full_sequence(
     dtype: torch.dtype,
 ) -> None:
     config = make_test_config()
-    layer = DecoderLayer(config).to(dtype=dtype).eval()
+    layer = DecoderLayer(config, layer_idx=0).to(dtype=dtype).eval()
     rotary_embedding = RotaryEmbedding(config)
     hidden_states = torch.randn(2, 5, config.hidden_size, dtype=dtype)
 
@@ -348,38 +373,37 @@ def test_decoder_layer_cached_decode_matches_full_sequence(
         decode_hidden_states, decode_position_ids
     )
     decode_mask = torch.zeros(1, 1, 1, 5, dtype=dtype)
+    full_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
+    incremental_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
 
     with torch.no_grad():
-        full_output, full_kv_cache = layer(
-            hidden_states, full_position_embeddings, full_mask
+        full_output = layer(
+            hidden_states, full_position_embeddings, full_mask, full_cache
         )
-        _, prefill_kv_cache = layer(
+        full_cache.advance(5)
+        layer(
             prefill_hidden_states,
             prefill_position_embeddings,
             prefill_mask,
+            incremental_cache,
         )
-        decode_output, decode_kv_cache = layer(
+        incremental_cache.advance(4)
+        decode_output = layer(
             decode_hidden_states,
             decode_position_embeddings,
             decode_mask,
-            prefill_kv_cache,
+            incremental_cache,
         )
+        incremental_cache.advance(1)
 
     torch.testing.assert_close(decode_output, full_output[:, 4:])
-    torch.testing.assert_close(decode_kv_cache[0], full_kv_cache[0])
-    torch.testing.assert_close(decode_kv_cache[1], full_kv_cache[1])
-    assert prefill_kv_cache[0].shape == (
-        2,
-        config.num_key_value_heads,
-        4,
-        config.head_dim,
+    torch.testing.assert_close(
+        incremental_cache.k_cache[0], full_cache.k_cache[0]
     )
-    assert decode_kv_cache[0].shape == (
-        2,
-        config.num_key_value_heads,
-        5,
-        config.head_dim,
+    torch.testing.assert_close(
+        incremental_cache.v_cache[0], full_cache.v_cache[0]
     )
+    assert incremental_cache.cur_len == 5
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -387,38 +411,22 @@ def test_model_cached_decode_matches_full_sequence(dtype: torch.dtype) -> None:
     config = make_test_config()
     model = MiniDecodeModel(config).to(dtype=dtype).eval()
     input_ids = torch.tensor([[1, 2, 3, 4, 5], [8, 7, 6, 5, 4]])
+    full_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
+    incremental_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
+    key_pointer = incremental_cache.k_cache.data_ptr()
+    value_pointer = incremental_cache.v_cache.data_ptr()
 
     with torch.no_grad():
-        full_output, full_kv_caches = model(input_ids)
-        _, prefill_kv_caches = model(input_ids[:, :4])
-        decode_output, decode_kv_caches = model(
-            input_ids[:, 4:], kv_caches=prefill_kv_caches
-        )
+        full_output = model(input_ids, full_cache)
+        model(input_ids[:, :4], incremental_cache)
+        decode_output = model(input_ids[:, 4:], incremental_cache)
 
     torch.testing.assert_close(decode_output, full_output[:, 4:])
-    assert len(prefill_kv_caches) == config.num_hidden_layers
-    assert len(decode_kv_caches) == config.num_hidden_layers
-    for layer_index in range(config.num_hidden_layers):
-        prefill_key, prefill_value = prefill_kv_caches[layer_index]
-        decode_key, decode_value = decode_kv_caches[layer_index]
-        full_key, full_value = full_kv_caches[layer_index]
-
-        assert prefill_key.shape == (
-            2,
-            config.num_key_value_heads,
-            4,
-            config.head_dim,
-        )
-        assert prefill_value.shape == prefill_key.shape
-        assert decode_key.shape == (
-            2,
-            config.num_key_value_heads,
-            5,
-            config.head_dim,
-        )
-        assert decode_value.shape == decode_key.shape
-        torch.testing.assert_close(decode_key, full_key)
-        torch.testing.assert_close(decode_value, full_value)
+    torch.testing.assert_close(incremental_cache.k_cache, full_cache.k_cache)
+    torch.testing.assert_close(incremental_cache.v_cache, full_cache.v_cache)
+    assert incremental_cache.cur_len == 5
+    assert incremental_cache.k_cache.data_ptr() == key_pointer
+    assert incremental_cache.v_cache.data_ptr() == value_pointer
 
 
 def test_causal_lm_ties_embedding_and_lm_head_weights() -> None:
@@ -438,9 +446,10 @@ def test_causal_lm_matches_hugging_face(dtype: torch.dtype) -> None:
     expected_model.load_state_dict(actual_model.state_dict())
     input_ids = torch.tensor([[1, 2, 3, 4, 5], [8, 7, 6, 5, 4]])
     position_ids = torch.tensor([[0, 1, 2, 3, 4], [2, 3, 4, 5, 6]])
+    kv_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
 
     with torch.no_grad():
-        actual, actual_kv_caches = actual_model(input_ids, position_ids)
+        actual = actual_model(input_ids, kv_cache, position_ids=position_ids)
         expected = expected_model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -449,7 +458,7 @@ def test_causal_lm_matches_hugging_face(dtype: torch.dtype) -> None:
     torch.testing.assert_close(actual, expected)
     assert actual.shape == (2, 5, config.vocab_size)
     assert actual.dtype == dtype
-    assert len(actual_kv_caches) == config.num_hidden_layers
+    assert kv_cache.cur_len == 5
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -457,18 +466,15 @@ def test_causal_lm_cached_decode_matches_full_sequence(dtype: torch.dtype) -> No
     config = make_test_config()
     model = MiniDecodeForCausalLM(config).to(dtype=dtype).eval()
     input_ids = torch.tensor([[1, 2, 3, 4, 5], [8, 7, 6, 5, 4]])
+    full_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
+    incremental_cache = make_test_cache(config, max_seq_len=5, dtype=dtype)
 
     with torch.no_grad():
-        full_logits, full_kv_caches = model(input_ids)
-        _, prefill_kv_caches = model(input_ids[:, :4])
-        decode_logits, decode_kv_caches = model(
-            input_ids[:, 4:], kv_caches=prefill_kv_caches
-        )
+        full_logits = model(input_ids, full_cache)
+        model(input_ids[:, :4], incremental_cache)
+        decode_logits = model(input_ids[:, 4:], incremental_cache)
 
     torch.testing.assert_close(decode_logits, full_logits[:, 4:])
-    assert len(decode_kv_caches) == config.num_hidden_layers
-    for decode_kv_cache, full_kv_cache in zip(
-        decode_kv_caches, full_kv_caches, strict=True
-    ):
-        torch.testing.assert_close(decode_kv_cache[0], full_kv_cache[0])
-        torch.testing.assert_close(decode_kv_cache[1], full_kv_cache[1])
+    torch.testing.assert_close(incremental_cache.k_cache, full_cache.k_cache)
+    torch.testing.assert_close(incremental_cache.v_cache, full_cache.v_cache)
+    assert incremental_cache.cur_len == 5
