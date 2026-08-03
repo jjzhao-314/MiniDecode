@@ -20,3 +20,7 @@ exclude = ["benchmarks*", "tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+fixable = ["I"]

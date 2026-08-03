@@ -1,27 +1,32 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
 
 from .config import MiniDecodeConfig
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6):
+    def __init__(self, hidden_size, eps: float):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        # 不用config是因为RMSNorm有时候对hidden_state做
+        # 有时候对head做，所以需要一个单独的参数指定
+        self.weight = nn.Parameter(torch.ones(hidden_size))  # bf16
         self.eps = eps
 
-    def forward(self, x: torch.Tensor):
-        origin_type = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x.to(origin_type)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # B, S, hidden_size
+    ):
+        origin_type = hidden_states.dtype
+        rms = hidden_states.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(rms + self.eps)
+        return self.weight * hidden_states.to(origin_type)
 
 
 class MLP(nn.Module):
     def __init__(self, config: MiniDecodeConfig):
         super().__init__()
+        # Qwen3 中不存在带bias的MLP
         self.gate_proj = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=False
         )
@@ -32,14 +37,20 @@ class MLP(nn.Module):
             config.intermediate_size, config.hidden_size, bias=False
         )
 
-    def forward(self, x: torch.Tensor):
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        hidden = F.silu(gate) * up
-        return self.down_proj(hidden)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # B, S, hidden_size
+    ):
+        gate = self.gate_proj(hidden_states)
+        up = self.up_proj(hidden_states)
+        result = F.silu(gate) * up
+        down = self.down_proj(result)
+        return down
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
+def rotate_half(
+    x: torch.Tensor,  # B, num_head, S, head_dim
+):
     x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat([-x2, x1], dim=-1)
 
@@ -47,164 +58,171 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 class RotaryEmbedding(nn.Module):
     def __init__(self, config: MiniDecodeConfig):
         super().__init__()
+        self.theta = config.rope_theta
         self.head_dim = config.head_dim
-        self.rope_theta = config.rope_theta
 
     def forward(
-        self, x: torch.Tensor, idxs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        origin_type = x.dtype
-        indices = torch.arange(
-            0, self.head_dim, 2, device=x.device, dtype=torch.float32
-        )
-        inv_freq = 1.0 / self.rope_theta ** (indices / self.head_dim)
-        positions = idxs.to(device=x.device, dtype=torch.float32)
-        freqs = positions.unsqueeze(-1) * inv_freq[None, None, :]
-        freqs = torch.cat([freqs, freqs], dim=-1).to(torch.float32)
-        cos = torch.cos(freqs).to(origin_type)
-        sin = torch.sin(freqs).to(origin_type)
+        self,
+        hidden_states: torch.Tensor,  # B, num_head, S, head_dim
+        positions: torch.Tensor,  # B, S
+    ):
+        origin_type = hidden_states.dtype
+        idxs = torch.arange(
+            0, self.head_dim, 2, dtype=torch.float32, device=hidden_states.device
+        )  # head_dim / 2
+        inv_freqs = 1.0 / self.theta ** (idxs / self.head_dim)  # head_dim / 2
+        angle = (
+            positions.to(torch.float32)[:, :, None] * inv_freqs[None, None, :]
+        )  # B, S, head_dim / 2
+        angle = torch.cat([angle, angle], dim=-1)  # B, S, head_dim
+        cos = torch.cos(angle).to(origin_type)  # B, S, head_dim
+        sin = torch.sin(angle).to(origin_type)  # B, S, head_dim
         return cos, sin
 
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
-    q_rotated = q * cos + rotate_half(q) * sin
-    k_rotated = k * cos + rotate_half(k) * sin
-    return q_rotated, k_rotated
+    q,  # B, num_head, S, head_dim
+    k,  # B, num_head, S, head_dim
+    cos,  # B, S, head_dim
+    sin,  # B, S, head_dim
+):
+    cos = cos[:, None, :, :]
+    sin = sin[:, None, :, :]
+
+    q = q * cos + rotate_half(q) * sin
+    k = k * cos + rotate_half(k) * sin
+    return q, k
 
 
 def repeat_kv(
-    hidden_states: torch.Tensor,
-    num_key_value_groups: int,
-) -> torch.Tensor:
-    if num_key_value_groups == 1:
-        return hidden_states
-    B, S, D = hidden_states.shape[0], hidden_states.shape[2], hidden_states.shape[3]
-    hidden_states = (
-        hidden_states.unsqueeze(2)
-        .tile([1, 1, num_key_value_groups, 1, 1])
-        .reshape(B, -1, S, D)
+    x: torch.Tensor,  # B, S, kv_head_num, head_dim
+    num_key_value_groups,
+):
+    shape = x.shape
+    return (
+        x.unsqueeze(2)
+        .tile(1, 1, num_key_value_groups, 1, 1)
+        .view(shape[0], -1, shape[2], shape[3])
     )
-    return hidden_states
-
-
-def make_causal_mask(x: torch.Tensor) -> torch.Tensor:
-    S = x.shape[1]
-    mask = torch.full(
-        (1, 1, S, S), torch.finfo(x.dtype).min, dtype=x.dtype, device=x.device
-    )
-    mask = torch.triu(mask, diagonal=1)
-    return mask
 
 
 class Attention(nn.Module):
     def __init__(self, config: MiniDecodeConfig):
         super().__init__()
         self.q_proj = nn.Linear(
-            config.hidden_size, config.query_projection_size, bias=config.attention_bias
+            config.hidden_size, config.query_projection_size, bias=False
         )
         self.k_proj = nn.Linear(
-            config.hidden_size, config.kv_projection_size, bias=config.attention_bias
+            config.hidden_size, config.kv_projection_size, bias=False
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, config.kv_projection_size, bias=config.attention_bias
+            config.hidden_size, config.kv_projection_size, bias=False
         )
         self.o_proj = nn.Linear(
-            config.query_projection_size, config.hidden_size, bias=config.attention_bias
+            config.query_projection_size, config.hidden_size, bias=False
         )
+        self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
+        self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
+        self.scaling = config.head_dim**-0.5
+
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = config.num_key_value_groups
-        self.head_dim = config.head_dim
-        self.scaling = self.head_dim**-0.5
-
-        self.q_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states: torch.Tensor,  # B, S, hidden_states
+        PE: tuple[torch.Tensor, torch.Tensor],  # B, S, head_dim
+        causal_mask: torch.Tensor,  # 1, 1, S, S
+    ):
         B, S, _ = hidden_states.shape
+        Q = self.q_proj(hidden_states)
+        K = self.k_proj(hidden_states)
+        V = self.v_proj(hidden_states)
         Q = (
-            self.q_proj(hidden_states)  # B, S, 2048
-            .reshape(B, S, self.num_attention_heads, self.head_dim)  # B, S, 16, 128
-            .transpose(1, 2)  # B, 16, S, 128
-            .contiguous()  # B, 16, S, 128
+            Q.unsqueeze(2)  # B, S, 1, hidden_states
+            .reshape(B, S, self.num_attention_heads, -1)  # B, S, q_head_num, head_dim
+            .transpose(1, 2)  # B, q_head_num, S, head_dim
+            .contiguous()
         )
         K = (
-            self.k_proj(hidden_states)  # B, S, 1024
-            .reshape(B, S, self.num_key_value_heads, self.head_dim)  # B, S, 8, 128
-            .transpose(1, 2)  # B, 8, S, 128
-            .contiguous()  # B, 8, S, 128
+            K.unsqueeze(2)  # B, S, 1, hidden_states
+            .reshape(B, S, self.num_key_value_heads, -1)  # B, S, kv_head_num, head_dim
+            .transpose(1, 2)  # B, kv_head_num, S, head_dim
+            .contiguous()
         )
         V = (
-            self.v_proj(hidden_states)  # B, S, 1024
-            .reshape(B, S, self.num_key_value_heads, self.head_dim)  # B, S, 8, 128
-            .transpose(1, 2)  # B, 8, S, 128
-            .contiguous()  # B, 8, S, 128
+            V.unsqueeze(2)  # B, S, 1, hidden_states
+            .reshape(B, S, self.num_key_value_heads, -1)  # B, S, kv_head_num, head_dim
+            .transpose(1, 2)  # B, kv_head_num, S, head_dim
+            .contiguous()
         )
 
-        Q = self.q_norm(Q)  # B, 16, S, 128
-        K = self.k_norm(K)  # B, 8, S, 128
+        Q = self.q_norm(Q)  # B, q_head_num, S, head_dim
+        K = self.k_norm(K)  # B, kv_head_num, S, head_dim
+
         Q, K = apply_rotary_pos_emb(
-            Q, K, position_embeddings[0], position_embeddings[1]
-        )
-        K = repeat_kv(K, self.num_key_value_groups)  # B, 16, S, 128
-        V = repeat_kv(V, self.num_key_value_groups)  # B, 16, S, 128
+            Q, K, PE[0], PE[1]
+        )  # B, q_head_num, S, head_dim, # B, kv_head_num, S, head_dim
 
-        scores = Q @ K.transpose(-1, -2)
+        K = repeat_kv(K, self.num_key_value_groups)  # B, q_head_num, S, head_dim
+        V = repeat_kv(V, self.num_key_value_groups)  # B, q_head_num, S, head_dim
+
+        scores = Q @ K.transpose(-1, -2)  # B, q_head_num, S, S
         scores = scores * self.scaling
 
-        scores = scores + attention_mask
-        origin_type = hidden_states.dtype
+        scores = scores + causal_mask  # B, q_head_num, S, S
+        origin_type = scores.dtype
         weights = torch.softmax(scores.to(torch.float32), dim=-1).to(
             origin_type
-        )  # B, 16, S, S
-        context = weights @ V  # B, 16, S, 128
-        context = context.transpose(1, 2).contiguous().view(B, S, -1)  # B, S, 2048
-        context = self.o_proj(context)  # B, S, 1024
+        )  # B, q_head_num, S, S
 
-        return context, weights
+        context = weights @ V  # B, q_head_num, S, head_dim
+        context = (
+            context.transpose(1, 2).contiguous().view(B, S, -1)
+        )  # B, S, query_projection_size
+
+        result = self.o_proj(context)  # B, S, hidden_size
+        return result
 
 
 class DecoderLayer(nn.Module):
     def __init__(self, config: MiniDecodeConfig):
         super().__init__()
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = Attention(config)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
         self.mlp = MLP(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps
+        )
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        hidden_states: torch.Tensor,  # B, S, hidden_size
+        PE: tuple[torch.Tensor, torch.Tensor],  # B, S, head_dim
+        causal_mask: torch.Tensor,  # 1, 1, S, S
+    ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, _ = self.self_attn(
-            hidden_states, position_embeddings, attention_mask
-        )
-        hidden_states = residual + hidden_states
-
+        hidden_states = self.self_attn(hidden_states, PE, causal_mask)
+        hidden_states = hidden_states + residual
         residual = hidden_states
-
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + residual
         return hidden_states
+
+
+def make_causal_mask(hidden_states: torch.Tensor):
+    S = hidden_states.shape[1]
+    minimal = torch.full(
+        (S, S),
+        torch.finfo(hidden_states.dtype).min,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )[None, None, :, :]
+    minimal = torch.triu(minimal, diagonal=1)
+    return minimal
 
 
 class MiniDecodeModel(nn.Module):
@@ -214,41 +232,30 @@ class MiniDecodeModel(nn.Module):
         self.layers = nn.ModuleList(
             [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(config)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)  # B, S, 1024
+    ):
+        hidden_states = self.embed_tokens(input_ids)
         if position_ids is None:
             position_ids = torch.arange(
-                input_ids.shape[1],
-                device=input_ids.device,
-            ).unsqueeze(0)  # 1, S
-
-        attention_mask = make_causal_mask(hidden_states)  # 1, 1, S, S
-        position_embeddings = self.rotary_emb(
-            hidden_states,
-            position_ids,
-        )  # 1, S, 128
+                input_ids.shape[1], device=input_ids.device
+            ).unsqueeze(0)
+        causal_mask = make_causal_mask(hidden_states)
+        PE = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
-            hidden_states = layer(
-                hidden_states,
-                position_embeddings,
-                attention_mask,
-            )
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+            hidden_states = layer(hidden_states, PE, causal_mask)
+        return self.norm(hidden_states)
 
 
 class MiniDecodeForCausalLM(nn.Module):
     def __init__(self, config: MiniDecodeConfig):
         super().__init__()
         self.model = MiniDecodeModel(config)
-
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -257,7 +264,7 @@ class MiniDecodeForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ):
         hidden_states = self.model(input_ids, position_ids)
         logits = self.lm_head(hidden_states)
         return logits
