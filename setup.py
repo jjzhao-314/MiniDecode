@@ -9,8 +9,10 @@ setup(
             sources=[
                 "csrc/bindings.cpp",
                 "csrc/add_one.cpp",
+                "csrc/write_kv_cache.cpp",
                 "csrc/runtime/block_manager.cpp",
                 "csrc/kernels/add_one.cu",
+                "csrc/kernels/write_kv_cache.cu",
             ],
         )
     ],

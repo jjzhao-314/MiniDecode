@@ -1,5 +1,7 @@
 import torch
 
+from . import _C
+
 
 class PagedKVCache:
     def __init__(
@@ -34,7 +36,7 @@ class PagedKVCache:
         layer_idx: int,
         K: torch.Tensor,  # 1, Hkv, S, D
         V: torch.Tensor,  # 1, Hkv, S, D
-        slot_mapping: list[int],  # S
+        slot_mapping: list[int] | torch.Tensor,  # S
     ) -> None:
         if layer_idx < 0 or layer_idx >= self.K.shape[0]:
             raise IndexError("invalid layer index")
@@ -49,8 +51,29 @@ class PagedKVCache:
         if len(slot_mapping) != S:
             raise ValueError("slot_mapping length must match the token count")
 
+        if K.is_cuda:
+            if not isinstance(slot_mapping, torch.Tensor):
+                slot_mapping = torch.tensor(
+                    slot_mapping,
+                    dtype=torch.int64,
+                    device=K.device,
+                )
+            _C.write_kv_cache(
+                K,
+                V,
+                self.K[layer_idx],
+                self.V[layer_idx],
+                slot_mapping,
+            )
+            return
+
+        if isinstance(slot_mapping, torch.Tensor):
+            slots = slot_mapping.tolist()
+        else:
+            slots = slot_mapping
+
         num_slots = self.K.shape[1] * self.block_size
-        for i, slot in enumerate(slot_mapping):
+        for i, slot in enumerate(slots):
             if slot < 0 or slot >= num_slots:
                 raise IndexError("invalid physical slot")
             physical = slot // self.block_size
@@ -69,9 +92,7 @@ class PagedKVCache:
         if num_tokens < 0:
             raise ValueError("num_tokens must be non-negative")
 
-        required_blocks = (
-            num_tokens + self.block_size - 1
-        ) // self.block_size
+        required_blocks = (num_tokens + self.block_size - 1) // self.block_size
         if len(block_ids) != required_blocks:
             raise ValueError("block_ids does not match num_tokens")
         for block_id in block_ids:

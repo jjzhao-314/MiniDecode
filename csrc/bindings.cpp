@@ -6,11 +6,17 @@ namespace minidecode {
 
 torch::Tensor add_one(torch::Tensor input);
 
+void write_kv_cache(torch::Tensor key, torch::Tensor value,
+                    torch::Tensor key_cache, torch::Tensor value_cache,
+                    torch::Tensor slot_mapping);
+
 }  // namespace minidecode
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("add_one", &minidecode::add_one,
                "Add one to each tensor element (CUDA)");
+    module.def("write_kv_cache", &minidecode::write_kv_cache,
+               "Write key and value tensors into a paged KV cache (CUDA)");
 
     pybind11::class_<minidecode::BlockManager>(module, "BlockManager")
         .def(pybind11::init<int>(), pybind11::arg("num_blocks"))

@@ -279,7 +279,12 @@ class MiniDecodeModel(nn.Module):
             if block_table.block_size != kv_caches.block_size:
                 raise ValueError("block table and cache block sizes must match")
             start = block_table.num_tokens
-            slot_mapping = block_table.append_tokens(token_len)
+            slots = block_table.append_tokens(token_len)
+            slot_mapping = torch.tensor(
+                slots,
+                dtype=torch.int64,
+                device=kv_caches.K.device,
+            )
         else:
             raise TypeError("unsupported KV cache type")
 

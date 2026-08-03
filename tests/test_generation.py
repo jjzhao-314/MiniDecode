@@ -208,6 +208,43 @@ def test_paged_generation_matches_contiguous_generation() -> None:
     torch.testing.assert_close(paged, contiguous)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_paged_generation_matches_contiguous_generation() -> None:
+    config = MiniDecodeConfig(
+        vocab_size=32,
+        hidden_size=64,
+        intermediate_size=192,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=128,
+        rms_norm_eps=1e-6,
+        rope_theta=1_000_000.0,
+        hidden_act="silu",
+        attention_bias=False,
+        tie_word_embeddings=True,
+    )
+    model = MiniDecodeForCausalLM(config).cuda().to(torch.bfloat16).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
+
+    contiguous = greedy_generate(
+        model,
+        input_ids,
+        max_new_tokens=4,
+        cache_mode="contiguous",
+    )
+    paged = greedy_generate(
+        model,
+        input_ids,
+        max_new_tokens=4,
+        cache_mode="paged",
+        block_size=2,
+    )
+
+    torch.testing.assert_close(paged, contiguous)
+
+
 def test_paged_generation_stops_after_eos_and_releases_blocks() -> None:
     input_ids = torch.tensor([[1, 2, 3]])
     model = PredictSequenceModel(

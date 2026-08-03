@@ -108,3 +108,30 @@ def test_allocation_failure_rolls_back_new_blocks() -> None:
     assert table.num_tokens == 4
     assert manager.num_free_blocks() == original_free_count
     assert manager.is_allocated(original_blocks[0])
+
+
+def test_multiple_requests_allocate_and_release_independently() -> None:
+    manager = _C.BlockManager(4)
+    first = SequenceBlockTable(manager, block_size=2)
+    second = SequenceBlockTable(manager, block_size=2)
+
+    first.append_tokens(3)
+    second.append_tokens(2)
+    first_blocks = set(first.block_ids)
+    second_blocks = set(second.block_ids)
+
+    assert first_blocks.isdisjoint(second_blocks)
+    assert manager.num_free_blocks() == 1
+
+    first.release()
+
+    assert manager.num_free_blocks() == 3
+    assert second.num_tokens == 2
+    assert set(second.block_ids) == second_blocks
+    assert all(manager.is_allocated(block_id) for block_id in second_blocks)
+
+    replacement = SequenceBlockTable(manager, block_size=2)
+    replacement.append_tokens(3)
+
+    assert set(replacement.block_ids).issubset(first_blocks)
+    assert set(replacement.block_ids).isdisjoint(second_blocks)

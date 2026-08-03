@@ -65,6 +65,34 @@ def test_write_keeps_layers_independent() -> None:
     torch.testing.assert_close(cache.K[1, 0, :, 1, :], K[0, :, 1, :])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_write_uses_kernel_and_matches_reference() -> None:
+    cache = PagedKVCache(
+        num_layers=2,
+        num_blocks=4,
+        num_kv_heads=3,
+        block_size=4,
+        head_dim=5,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    cache.K.zero_()
+    cache.V.zero_()
+    K, V = make_kv(num_tokens=3)
+    K = K.cuda()
+    V = V.cuda()
+    slot_mapping = torch.tensor([7, 8, 13], device="cuda", dtype=torch.int64)
+
+    cache.write(0, K, V, slot_mapping)
+
+    torch.testing.assert_close(cache.K[0, 1, :, 3, :], K[0, :, 0, :])
+    torch.testing.assert_close(cache.V[0, 1, :, 3, :], V[0, :, 0, :])
+    torch.testing.assert_close(cache.K[0, 2, :, 0, :], K[0, :, 1, :])
+    torch.testing.assert_close(cache.V[0, 2, :, 0, :], V[0, :, 1, :])
+    torch.testing.assert_close(cache.K[0, 3, :, 1, :], K[0, :, 2, :])
+    torch.testing.assert_close(cache.V[0, 3, :, 1, :], V[0, :, 2, :])
+
+
 @pytest.mark.parametrize("block_size", [0, -1])
 def test_paged_kv_cache_rejects_non_positive_block_size(block_size: int) -> None:
     with pytest.raises(ValueError, match="block_size must be positive"):
