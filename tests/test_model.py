@@ -12,6 +12,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb as hf_apply_rotary_pos_emb,
 )
 
+from minidecode import _C
+from minidecode.block_table import SequenceBlockTable
 from minidecode.config import MiniDecodeConfig
 from minidecode.kv_cache import ContiguousKVCache
 from minidecode.model import (
@@ -27,6 +29,7 @@ from minidecode.model import (
     repeat_kv,
     rotate_half,
 )
+from minidecode.paged_kv_cache import PagedKVCache
 
 
 def make_test_config() -> MiniDecodeConfig:
@@ -79,6 +82,24 @@ def make_test_cache(
         batch_size=batch_size,
         num_kv_heads=config.num_key_value_heads,
         max_seq_len=max_seq_len,
+        head_dim=config.head_dim,
+        dtype=dtype,
+        device=torch.device("cpu"),
+    )
+
+
+def make_test_paged_cache(
+    config: MiniDecodeConfig,
+    *,
+    num_blocks: int = 4,
+    block_size: int = 4,
+    dtype: torch.dtype = torch.float32,
+) -> PagedKVCache:
+    return PagedKVCache(
+        num_layers=config.num_hidden_layers,
+        num_blocks=num_blocks,
+        num_kv_heads=config.num_key_value_heads,
+        block_size=block_size,
         head_dim=config.head_dim,
         dtype=dtype,
         device=torch.device("cpu"),
@@ -306,6 +327,122 @@ def test_attention_matches_hugging_face(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_attention_paged_prefill_matches_contiguous(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    attention = Attention(config, layer_idx=0).to(dtype=dtype).eval()
+    rotary_embedding = RotaryEmbedding(config)
+    hidden_states = torch.randn(1, 6, config.hidden_size, dtype=dtype)
+    position_ids = torch.arange(6).unsqueeze(0)
+    position_embeddings = rotary_embedding(hidden_states, position_ids)
+    attention_mask = make_causal_mask(hidden_states)
+
+    contiguous_cache = make_test_cache(
+        config, batch_size=1, max_seq_len=6, dtype=dtype
+    )
+    paged_cache = make_test_paged_cache(config, block_size=4, dtype=dtype)
+    block_table = SequenceBlockTable(_C.BlockManager(4), block_size=4)
+    slot_mapping = block_table.append_tokens(6)
+
+    with torch.no_grad():
+        contiguous_output = attention(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            contiguous_cache,
+        )
+        paged_output = attention(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            paged_cache,
+            block_table,
+            slot_mapping,
+        )
+
+    paged_k, paged_v = paged_cache.read(
+        layer_idx=0,
+        block_ids=block_table.block_ids,
+        num_tokens=block_table.num_tokens,
+    )
+    torch.testing.assert_close(paged_output, contiguous_output)
+    torch.testing.assert_close(paged_k, contiguous_cache.k_cache[0, :, :, :6])
+    torch.testing.assert_close(paged_v, contiguous_cache.v_cache[0, :, :, :6])
+    assert len(block_table.block_ids) == 2
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_attention_paged_decode_matches_contiguous(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    attention = Attention(config, layer_idx=0).to(dtype=dtype).eval()
+    rotary_embedding = RotaryEmbedding(config)
+    hidden_states = torch.randn(1, 6, config.hidden_size, dtype=dtype)
+
+    contiguous_cache = make_test_cache(
+        config, batch_size=1, max_seq_len=6, dtype=dtype
+    )
+    paged_cache = make_test_paged_cache(config, block_size=4, dtype=dtype)
+    block_table = SequenceBlockTable(_C.BlockManager(4), block_size=4)
+
+    prefill_hidden_states = hidden_states[:, :5]
+    prefill_positions = torch.arange(5).unsqueeze(0)
+    prefill_position_embeddings = rotary_embedding(
+        prefill_hidden_states, prefill_positions
+    )
+    prefill_mask = make_causal_mask(prefill_hidden_states)
+    prefill_slots = block_table.append_tokens(5)
+
+    with torch.no_grad():
+        attention(
+            prefill_hidden_states,
+            prefill_position_embeddings,
+            prefill_mask,
+            contiguous_cache,
+        )
+        attention(
+            prefill_hidden_states,
+            prefill_position_embeddings,
+            prefill_mask,
+            paged_cache,
+            block_table,
+            prefill_slots,
+        )
+        contiguous_cache.advance(5)
+
+        decode_hidden_states = hidden_states[:, 5:]
+        decode_positions = torch.tensor([[5]])
+        decode_position_embeddings = rotary_embedding(
+            decode_hidden_states, decode_positions
+        )
+        decode_mask = torch.zeros(1, 1, 1, 6, dtype=dtype)
+        decode_slots = block_table.append_tokens(1)
+
+        contiguous_output = attention(
+            decode_hidden_states,
+            decode_position_embeddings,
+            decode_mask,
+            contiguous_cache,
+        )
+        paged_output = attention(
+            decode_hidden_states,
+            decode_position_embeddings,
+            decode_mask,
+            paged_cache,
+            block_table,
+            decode_slots,
+        )
+
+    paged_k, paged_v = paged_cache.read(
+        layer_idx=0,
+        block_ids=block_table.block_ids,
+        num_tokens=block_table.num_tokens,
+    )
+    torch.testing.assert_close(paged_output, contiguous_output)
+    torch.testing.assert_close(paged_k, contiguous_cache.k_cache[0, :, :, :6])
+    torch.testing.assert_close(paged_v, contiguous_cache.v_cache[0, :, :, :6])
+    assert decode_slots[0] % block_table.block_size == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_decoder_layer_matches_hugging_face(dtype: torch.dtype) -> None:
     config = make_test_config()
     hf_config = make_hf_test_config(config)
@@ -345,6 +482,120 @@ def test_decoder_layer_matches_hugging_face(dtype: torch.dtype) -> None:
     assert kv_cache.v_cache[0, :, :, :5].shape == kv_cache.k_cache[
         0, :, :, :5
     ].shape
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_decoder_layer_paged_prefill_matches_contiguous(
+    dtype: torch.dtype,
+) -> None:
+    config = make_test_config()
+    layer = DecoderLayer(config, layer_idx=0).to(dtype=dtype).eval()
+    rotary_embedding = RotaryEmbedding(config)
+    hidden_states = torch.randn(1, 6, config.hidden_size, dtype=dtype)
+    position_ids = torch.arange(6).unsqueeze(0)
+    position_embeddings = rotary_embedding(hidden_states, position_ids)
+    attention_mask = make_causal_mask(hidden_states)
+
+    contiguous_cache = make_test_cache(
+        config, batch_size=1, max_seq_len=6, dtype=dtype
+    )
+    paged_cache = make_test_paged_cache(config, block_size=4, dtype=dtype)
+    block_table = SequenceBlockTable(_C.BlockManager(4), block_size=4)
+    slot_mapping = block_table.append_tokens(6)
+
+    with torch.no_grad():
+        contiguous_output = layer(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            contiguous_cache,
+        )
+        paged_output = layer(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            paged_cache,
+            block_table,
+            slot_mapping,
+        )
+
+    paged_k, paged_v = paged_cache.read(
+        layer_idx=0,
+        block_ids=block_table.block_ids,
+        num_tokens=block_table.num_tokens,
+    )
+    torch.testing.assert_close(paged_output, contiguous_output)
+    torch.testing.assert_close(paged_k, contiguous_cache.k_cache[0, :, :, :6])
+    torch.testing.assert_close(paged_v, contiguous_cache.v_cache[0, :, :, :6])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_decoder_layer_paged_decode_matches_contiguous(dtype: torch.dtype) -> None:
+    config = make_test_config()
+    layer = DecoderLayer(config, layer_idx=0).to(dtype=dtype).eval()
+    rotary_embedding = RotaryEmbedding(config)
+    hidden_states = torch.randn(1, 6, config.hidden_size, dtype=dtype)
+
+    contiguous_cache = make_test_cache(
+        config, batch_size=1, max_seq_len=6, dtype=dtype
+    )
+    paged_cache = make_test_paged_cache(config, block_size=4, dtype=dtype)
+    block_table = SequenceBlockTable(_C.BlockManager(4), block_size=4)
+
+    prefill_hidden_states = hidden_states[:, :5]
+    prefill_position_embeddings = rotary_embedding(
+        prefill_hidden_states, torch.arange(5).unsqueeze(0)
+    )
+    prefill_mask = make_causal_mask(prefill_hidden_states)
+    prefill_slots = block_table.append_tokens(5)
+
+    with torch.no_grad():
+        layer(
+            prefill_hidden_states,
+            prefill_position_embeddings,
+            prefill_mask,
+            contiguous_cache,
+        )
+        layer(
+            prefill_hidden_states,
+            prefill_position_embeddings,
+            prefill_mask,
+            paged_cache,
+            block_table,
+            prefill_slots,
+        )
+        contiguous_cache.advance(5)
+
+        decode_hidden_states = hidden_states[:, 5:]
+        decode_position_embeddings = rotary_embedding(
+            decode_hidden_states, torch.tensor([[5]])
+        )
+        decode_mask = torch.zeros(1, 1, 1, 6, dtype=dtype)
+        decode_slots = block_table.append_tokens(1)
+
+        contiguous_output = layer(
+            decode_hidden_states,
+            decode_position_embeddings,
+            decode_mask,
+            contiguous_cache,
+        )
+        paged_output = layer(
+            decode_hidden_states,
+            decode_position_embeddings,
+            decode_mask,
+            paged_cache,
+            block_table,
+            decode_slots,
+        )
+
+    paged_k, paged_v = paged_cache.read(
+        layer_idx=0,
+        block_ids=block_table.block_ids,
+        num_tokens=block_table.num_tokens,
+    )
+    torch.testing.assert_close(paged_output, contiguous_output)
+    torch.testing.assert_close(paged_k, contiguous_cache.k_cache[0, :, :, :6])
+    torch.testing.assert_close(paged_v, contiguous_cache.v_cache[0, :, :, :6])
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -429,6 +680,104 @@ def test_model_cached_decode_matches_full_sequence(dtype: torch.dtype) -> None:
     assert incremental_cache.v_cache.data_ptr() == value_pointer
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_model_paged_prefill_and_decode_match_contiguous(
+    dtype: torch.dtype,
+) -> None:
+    config = make_test_config()
+    model = MiniDecodeModel(config).to(dtype=dtype).eval()
+    prompt_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    decode_ids = torch.tensor([[6]])
+
+    contiguous_cache = make_test_cache(
+        config, batch_size=1, max_seq_len=6, dtype=dtype
+    )
+    paged_cache = make_test_paged_cache(config, block_size=4, dtype=dtype)
+    block_table = SequenceBlockTable(_C.BlockManager(4), block_size=4)
+
+    with torch.no_grad():
+        contiguous_prefill = model(prompt_ids, contiguous_cache)
+        paged_prefill = model(prompt_ids, paged_cache, block_table=block_table)
+        contiguous_decode = model(decode_ids, contiguous_cache)
+        paged_decode = model(decode_ids, paged_cache, block_table=block_table)
+
+    torch.testing.assert_close(paged_prefill, contiguous_prefill)
+    torch.testing.assert_close(paged_decode, contiguous_decode)
+    assert contiguous_cache.cur_len == 6
+    assert block_table.num_tokens == 6
+    assert len(block_table.block_ids) == 2
+
+    for layer_idx in range(config.num_hidden_layers):
+        paged_k, paged_v = paged_cache.read(
+            layer_idx=layer_idx,
+            block_ids=block_table.block_ids,
+            num_tokens=block_table.num_tokens,
+        )
+        torch.testing.assert_close(
+            paged_k, contiguous_cache.k_cache[layer_idx, :, :, :6]
+        )
+        torch.testing.assert_close(
+            paged_v, contiguous_cache.v_cache[layer_idx, :, :, :6]
+        )
+
+
+def test_model_paged_supports_explicit_position_ids() -> None:
+    config = make_test_config()
+    model = MiniDecodeModel(config).eval()
+    input_ids = torch.tensor([[1, 2, 3]])
+    position_ids = torch.tensor([[7, 8, 9]])
+    contiguous_cache = make_test_cache(config, batch_size=1, max_seq_len=3)
+    paged_cache = make_test_paged_cache(config, block_size=4)
+    block_table = SequenceBlockTable(_C.BlockManager(2), block_size=4)
+
+    with torch.no_grad():
+        contiguous_output = model(
+            input_ids, contiguous_cache, position_ids=position_ids
+        )
+        paged_output = model(
+            input_ids,
+            paged_cache,
+            position_ids=position_ids,
+            block_table=block_table,
+        )
+
+    torch.testing.assert_close(paged_output, contiguous_output)
+    assert block_table.num_tokens == 3
+
+
+def test_model_paged_requires_block_table() -> None:
+    config = make_test_config()
+    model = MiniDecodeModel(config).eval()
+    paged_cache = make_test_paged_cache(config)
+
+    with pytest.raises(ValueError, match="block_table is required"):
+        model(torch.tensor([[1]]), paged_cache)
+
+
+def test_model_paged_rejects_batch_before_allocating() -> None:
+    config = make_test_config()
+    model = MiniDecodeModel(config).eval()
+    paged_cache = make_test_paged_cache(config)
+    block_table = SequenceBlockTable(_C.BlockManager(2), block_size=4)
+
+    with pytest.raises(ValueError, match="batch size 1"):
+        model(torch.tensor([[1], [2]]), paged_cache, block_table=block_table)
+
+    assert block_table.num_tokens == 0
+
+
+def test_model_paged_rejects_mismatched_block_size_before_allocating() -> None:
+    config = make_test_config()
+    model = MiniDecodeModel(config).eval()
+    paged_cache = make_test_paged_cache(config, block_size=4)
+    block_table = SequenceBlockTable(_C.BlockManager(2), block_size=8)
+
+    with pytest.raises(ValueError, match="block sizes must match"):
+        model(torch.tensor([[1]]), paged_cache, block_table=block_table)
+
+    assert block_table.num_tokens == 0
+
+
 def test_causal_lm_ties_embedding_and_lm_head_weights() -> None:
     model = MiniDecodeForCausalLM(make_test_config())
 
@@ -478,6 +827,62 @@ def test_causal_lm_cached_decode_matches_full_sequence(dtype: torch.dtype) -> No
     torch.testing.assert_close(incremental_cache.k_cache, full_cache.k_cache)
     torch.testing.assert_close(incremental_cache.v_cache, full_cache.v_cache)
     assert incremental_cache.cur_len == 5
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_causal_lm_paged_prefill_and_decode_match_contiguous(
+    dtype: torch.dtype,
+) -> None:
+    config = make_test_config()
+    model = MiniDecodeForCausalLM(config).to(dtype=dtype).eval()
+    prompt_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    decode_ids = torch.tensor([[6]])
+
+    contiguous_cache = make_test_cache(
+        config, batch_size=1, max_seq_len=6, dtype=dtype
+    )
+    paged_cache = make_test_paged_cache(config, block_size=4, dtype=dtype)
+    block_table = SequenceBlockTable(_C.BlockManager(4), block_size=4)
+
+    with torch.no_grad():
+        contiguous_prefill = model(prompt_ids, contiguous_cache)
+        paged_prefill = model(prompt_ids, paged_cache, block_table=block_table)
+        contiguous_decode = model(decode_ids, contiguous_cache)
+        paged_decode = model(decode_ids, paged_cache, block_table=block_table)
+
+    torch.testing.assert_close(paged_prefill, contiguous_prefill)
+    torch.testing.assert_close(paged_decode, contiguous_decode)
+    assert paged_prefill.shape == (1, 5, config.vocab_size)
+    assert paged_decode.shape == (1, 1, config.vocab_size)
+    assert block_table.num_tokens == 6
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_causal_lm_paged_last_token_logits_match_full_logits(
+    dtype: torch.dtype,
+) -> None:
+    config = make_test_config()
+    model = MiniDecodeForCausalLM(config).to(dtype=dtype).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+
+    full_cache = make_test_paged_cache(config, block_size=4, dtype=dtype)
+    full_table = SequenceBlockTable(_C.BlockManager(4), block_size=4)
+    last_cache = make_test_paged_cache(config, block_size=4, dtype=dtype)
+    last_table = SequenceBlockTable(_C.BlockManager(4), block_size=4)
+
+    with torch.no_grad():
+        full_logits = model(input_ids, full_cache, block_table=full_table)
+        last_logits = model(
+            input_ids,
+            last_cache,
+            last_token_only=True,
+            block_table=last_table,
+        )
+
+    torch.testing.assert_close(last_logits, full_logits[:, -1:])
+    assert full_logits.shape == (1, 5, config.vocab_size)
+    assert last_logits.shape == (1, 1, config.vocab_size)
+    assert full_table.num_tokens == last_table.num_tokens == 5
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

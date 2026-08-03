@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from .config import MiniDecodeConfig
 from .kv_cache import ContiguousKVCache
+from .paged_kv_cache import PagedKVCache
 
 
 class RMSNorm(nn.Module):
@@ -135,8 +136,10 @@ class Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,  # B, S, hidden_states
         PE: tuple[torch.Tensor, torch.Tensor],  # B, S, head_dim
-        causal_mask: torch.Tensor,  # 1, 1, S, S
-        kv_cache: ContiguousKVCache,
+        causal_mask: torch.Tensor,  # 1, 1, S, T
+        kv_cache: ContiguousKVCache | PagedKVCache,
+        block_table=None,
+        slot_mapping=None,
     ):
         B, S, _ = hidden_states.shape
         Q = self.q_proj(hidden_states)
@@ -169,8 +172,19 @@ class Attention(nn.Module):
         )  # B, q_head_num, S, head_dim, # B, kv_head_num, S, head_dim
 
         # save kv cache
-        k_cache, v_cache = kv_cache.update(self.layer_idx, K, V)
-
+        if isinstance(kv_cache, ContiguousKVCache):
+            k_cache, v_cache = kv_cache.update(self.layer_idx, K, V)
+        elif isinstance(kv_cache, PagedKVCache):
+            if block_table is None or slot_mapping is None:
+                raise ValueError(
+                    "block_table and slot_mapping are required for PagedKVCache"
+                )
+            kv_cache.write(self.layer_idx, K, V, slot_mapping)
+            k_cache, v_cache = kv_cache.read(
+                self.layer_idx, block_table.block_ids, block_table.num_tokens
+            )
+        else:
+            raise TypeError("unsupported KV cache type")
         K = repeat_kv(k_cache, self.num_key_value_groups)  # B, q_head_num, S, head_dim
         V = repeat_kv(v_cache, self.num_key_value_groups)  # B, q_head_num, S, head_dim
 
@@ -204,12 +218,16 @@ class DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,  # B, S, hidden_size
         PE: tuple[torch.Tensor, torch.Tensor],  # B, S, head_dim
-        causal_mask: torch.Tensor,  # 1, 1, S, S
-        kv_cache: ContiguousKVCache,
+        causal_mask: torch.Tensor,  # 1, 1, S, T
+        kv_cache: ContiguousKVCache | PagedKVCache,
+        block_table=None,
+        slot_mapping=None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, PE, causal_mask, kv_cache)
+        hidden_states = self.self_attn(
+            hidden_states, PE, causal_mask, kv_cache, block_table, slot_mapping
+        )
         hidden_states = hidden_states + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -243,13 +261,29 @@ class MiniDecodeModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        kv_caches: ContiguousKVCache,
+        kv_caches: ContiguousKVCache | PagedKVCache,
         position_ids: torch.Tensor | None = None,
+        block_table=None,
     ):
         hidden_states = self.embed_tokens(input_ids)
         token_len = input_ids.shape[1]
-        if position_ids is None:
+
+        if isinstance(kv_caches, ContiguousKVCache):
             start = kv_caches.cur_len
+            slot_mapping = None
+        elif isinstance(kv_caches, PagedKVCache):
+            if block_table is None:
+                raise ValueError("block_table is required for PagedKVCache")
+            if input_ids.shape[0] != 1:
+                raise ValueError("PagedKVCache currently requires batch size 1")
+            if block_table.block_size != kv_caches.block_size:
+                raise ValueError("block table and cache block sizes must match")
+            start = block_table.num_tokens
+            slot_mapping = block_table.append_tokens(token_len)
+        else:
+            raise TypeError("unsupported KV cache type")
+
+        if position_ids is None:
             end = start + token_len
             position_ids = torch.arange(start, end, device=input_ids.device).unsqueeze(
                 0
@@ -257,8 +291,11 @@ class MiniDecodeModel(nn.Module):
         causal_mask = make_causal_mask(hidden_states)
         PE = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, PE, causal_mask, kv_caches)
-        kv_caches.advance(token_len)
+            hidden_states = layer(
+                hidden_states, PE, causal_mask, kv_caches, block_table, slot_mapping
+            )
+        if isinstance(kv_caches, ContiguousKVCache):
+            kv_caches.advance(token_len)
         return self.norm(hidden_states)
 
 
@@ -274,11 +311,14 @@ class MiniDecodeForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        kv_caches: ContiguousKVCache,
+        kv_caches: ContiguousKVCache | PagedKVCache,
         position_ids: torch.Tensor | None = None,
         last_token_only: bool = False,
+        block_table=None,
     ):
-        hidden_states = self.model(input_ids, kv_caches, position_ids)
+        hidden_states = self.model(
+            input_ids, kv_caches, position_ids=position_ids, block_table=block_table
+        )
         if last_token_only:
             logits = self.lm_head(hidden_states[:, -1:, :])
         else:
