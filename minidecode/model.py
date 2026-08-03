@@ -134,6 +134,8 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,  # B, S, hidden_states
         PE: tuple[torch.Tensor, torch.Tensor],  # B, S, head_dim
         causal_mask: torch.Tensor,  # 1, 1, S, S
+        kv_cache: tuple[torch.Tensor, torch.Tensor]
+        | None = None,  # B, Hkv, T, head_dim
     ):
         B, S, _ = hidden_states.shape
         Q = self.q_proj(hidden_states)
@@ -165,8 +167,22 @@ class Attention(nn.Module):
             Q, K, PE[0], PE[1]
         )  # B, q_head_num, S, head_dim, # B, kv_head_num, S, head_dim
 
-        K = repeat_kv(K, self.num_key_value_groups)  # B, q_head_num, S, head_dim
-        V = repeat_kv(V, self.num_key_value_groups)  # B, q_head_num, S, head_dim
+        # save kv cache
+        if kv_cache is None:
+            k_cache = K
+            v_cache = V
+        else:
+            k_cache, v_cache = kv_cache
+            k_cache = torch.cat([k_cache, K], dim=2)
+            v_cache = torch.cat([v_cache, V], dim=2)
+
+        present_kv_cache = (k_cache, v_cache)
+        K = repeat_kv(
+            present_kv_cache[0], self.num_key_value_groups
+        )  # B, q_head_num, S, head_dim
+        V = repeat_kv(
+            present_kv_cache[1], self.num_key_value_groups
+        )  # B, q_head_num, S, head_dim
 
         scores = Q @ K.transpose(-1, -2)  # B, q_head_num, S, S
         scores = scores * self.scaling
@@ -183,7 +199,7 @@ class Attention(nn.Module):
         )  # B, S, query_projection_size
 
         result = self.o_proj(context)  # B, S, hidden_size
-        return result
+        return result, present_kv_cache
 
 
 class DecoderLayer(nn.Module):
@@ -192,25 +208,26 @@ class DecoderLayer(nn.Module):
         self.self_attn = Attention(config)
         self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,  # B, S, hidden_size
         PE: tuple[torch.Tensor, torch.Tensor],  # B, S, head_dim
         causal_mask: torch.Tensor,  # 1, 1, S, S
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, PE, causal_mask)
+        hidden_states, present_kv_cache = self.self_attn(
+            hidden_states, PE, causal_mask, kv_cache
+        )
         hidden_states = hidden_states + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = hidden_states + residual
-        return hidden_states
+        return hidden_states, present_kv_cache
 
 
 def make_causal_mask(hidden_states: torch.Tensor):
@@ -239,17 +256,27 @@ class MiniDecodeModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ):
         hidden_states = self.embed_tokens(input_ids)
         if position_ids is None:
-            position_ids = torch.arange(
-                input_ids.shape[1], device=input_ids.device
-            ).unsqueeze(0)
+            if kv_caches is not None:
+                start = kv_caches[0][0].shape[2]
+                end = start + input_ids.shape[1]
+            else:
+                start = 0
+                end = input_ids.shape[1]
+            position_ids = torch.arange(start, end, device=input_ids.device).unsqueeze(
+                0
+            )
         causal_mask = make_causal_mask(hidden_states)
         PE = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, PE, causal_mask)
-        return self.norm(hidden_states)
+        present_kv_caches = []
+        for i, layer in enumerate(self.layers):
+            cache = None if kv_caches is None else kv_caches[i]
+            hidden_states, cache = layer(hidden_states, PE, causal_mask, cache)
+            present_kv_caches.append(cache)
+        return self.norm(hidden_states), present_kv_caches
 
 
 class MiniDecodeForCausalLM(nn.Module):
@@ -264,7 +291,8 @@ class MiniDecodeForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ):
-        hidden_states = self.model(input_ids, position_ids)
+        hidden_states, present_kv_cache = self.model(input_ids, position_ids, kv_caches)
         logits = self.lm_head(hidden_states)
-        return logits
+        return logits, present_kv_cache

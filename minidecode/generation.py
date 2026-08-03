@@ -11,11 +11,14 @@ def greedy_generate(
 ) -> torch.Tensor:
     with torch.no_grad():
         generated = input_ids
+        model_input = generated
+        kv_caches = None
         for _ in range(max_new_tokens):
-            output = model(generated)
+            output, kv_caches = model(model_input, kv_caches=kv_caches)
             next_logits = output[:, -1, :]
             next_id = torch.argmax(next_logits, dim=-1)
-            generated = torch.cat([generated, next_id[None, :]], dim=-1)
+            model_input = next_id[:, None]
+            generated = torch.cat([generated, model_input], dim=-1)
             if next_id == eos_token_id:
                 break
         return generated
