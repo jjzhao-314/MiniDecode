@@ -9,6 +9,7 @@ setup(
             sources=[
                 "csrc/bindings.cpp",
                 "csrc/add_one.cpp",
+                "csrc/runtime/block_manager.cpp",
                 "csrc/kernels/add_one.cu",
             ],
         )
